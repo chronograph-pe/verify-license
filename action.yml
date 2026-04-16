@@ -39,11 +39,17 @@ runs:
         language   = os.environ.get('LANGUAGE', 'node')
         bom_file   = os.environ.get('BOM_FILE', 'bom.xml')
 
+        workspace = os.path.realpath(os.environ.get('GITHUB_WORKSPACE', '.'))
+        bom_path  = os.path.realpath(bom_file)
+        if not bom_path.startswith(workspace + os.sep) and bom_path != workspace:
+            print(f'Error: bom-file resolves to {bom_path} which is outside the workspace', file=sys.stderr)
+            sys.exit(1)
+
         if not violations:
             print(json.dumps({'confirmed': [], 'corrected': [], 'unverifiable': [], 'has_corrections': False}))
             sys.exit(0)
 
-        tree = ET.parse(bom_file)
+        tree = ET.parse(bom_path)
         root = tree.getroot()
         ns_match = re.match(r'\{(.*)\}', root.tag)
         ns_uri   = ns_match.group(1) if ns_match else 'http://cyclonedx.org/schema/bom/1.4'
@@ -66,7 +72,7 @@ runs:
 
         def fetch_rubygems_license(name, version):
             try:
-                url = f'https://rubygems.org/api/v1/versions/{name}.json'
+                url = f'https://rubygems.org/api/v1/versions/{urllib.parse.quote(name, safe="")}.json'
                 req = urllib.request.Request(url, headers={'Accept': 'application/json'})
                 with urllib.request.urlopen(req, timeout=15) as r:
                     for v in json.loads(r.read()):
@@ -116,7 +122,7 @@ runs:
                 corrected.append({**v, 'correct_license': registry_license, 'bom_updated': updated})
 
         if has_corrections:
-            tree.write(bom_file, xml_declaration=True, encoding='unicode')
+            tree.write(bom_path, xml_declaration=True, encoding='unicode')
 
         print(json.dumps({
             'confirmed': confirmed,
