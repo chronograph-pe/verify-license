@@ -1,0 +1,131 @@
+name: verify-license
+description: 'Cross-references dependency license violations against the authoritative package registry, corrects SBOM metadata where wrong, and returns only confirmed violations'
+
+inputs:
+  violations:
+    required: true
+    description: 'JSON array of violations from Dependency Track'
+  language:
+    required: true
+    description: 'Language of the scanned project (node or ruby)'
+  bom-file:
+    required: true
+    description: 'Path to bom.xml relative to the workspace root'
+
+outputs:
+  confirmed:
+    description: 'JSON array of violations confirmed by the package registry'
+    value: ${{ steps.verify.outputs.confirmed }}
+  has_corrections:
+    description: 'true if bom.xml was updated with corrected license metadata'
+    value: ${{ steps.verify.outputs.has_corrections }}
+
+runs:
+  using: composite
+  steps:
+    - name: Verify Licenses Against Registry
+      id: verify
+      shell: bash
+      env:
+        VIOLATIONS: ${{ inputs.violations }}
+        LANGUAGE: ${{ inputs.language }}
+        BOM_FILE: ${{ inputs.bom-file }}
+      run: |
+        cat > /tmp/verify_licenses.py << 'PYEOF'
+        import json, os, re, sys, urllib.parse, urllib.request
+        import xml.etree.ElementTree as ET
+
+        violations = json.loads(os.environ.get('VIOLATIONS', '[]') or '[]')
+        language   = os.environ.get('LANGUAGE', 'node')
+        bom_file   = os.environ.get('BOM_FILE', 'bom.xml')
+
+        if not violations:
+            print(json.dumps({'confirmed': [], 'corrected': [], 'unverifiable': [], 'has_corrections': False}))
+            sys.exit(0)
+
+        tree = ET.parse(bom_file)
+        root = tree.getroot()
+        ns_match = re.match(r'\{(.*)\}', root.tag)
+        ns_uri   = ns_match.group(1) if ns_match else 'http://cyclonedx.org/schema/bom/1.4'
+        ET.register_namespace('', ns_uri)
+
+        def normalize(s):
+            return (s or '').strip().upper()
+
+        def fetch_npm_license(name, version):
+            try:
+                encoded = urllib.parse.quote(name, safe='@/')
+                url = f'https://registry.npmjs.org/{encoded}/{version}'
+                req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = json.loads(r.read())
+                    lic = data.get('license', '')
+                    return (lic.get('type', '') if isinstance(lic, dict) else str(lic)).strip() or None
+            except Exception:
+                return None
+
+        def fetch_rubygems_license(name, version):
+            try:
+                url = f'https://rubygems.org/api/v1/versions/{name}.json'
+                req = urllib.request.Request(url, headers={'Accept': 'application/json'})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    for v in json.loads(r.read()):
+                        if v.get('number') == version:
+                            lics = v.get('licenses') or []
+                            return ', '.join(lics) if lics else None
+            except Exception:
+                return None
+
+        def update_bom_license(name, version, new_license):
+            for comp in root.iter(f'{{{ns_uri}}}component'):
+                if (comp.findtext(f'{{{ns_uri}}}name') == name and
+                        comp.findtext(f'{{{ns_uri}}}version') == version):
+                    lics_el = comp.find(f'{{{ns_uri}}}licenses')
+                    if lics_el is None:
+                        lics_el = ET.SubElement(comp, f'{{{ns_uri}}}licenses')
+                    else:
+                        for child in list(lics_el):
+                            lics_el.remove(child)
+                    lic_el = ET.SubElement(lics_el, f'{{{ns_uri}}}license')
+                    ET.SubElement(lic_el, f'{{{ns_uri}}}id').text = new_license
+                    return True
+            return False
+
+        confirmed, corrected, unverifiable = [], [], []
+        has_corrections = False
+
+        fetchers = {'node': fetch_npm_license, 'ruby': fetch_rubygems_license}
+        fetch = fetchers.get(language)
+
+        for v in violations:
+            name, version, reported = v.get('component', ''), v.get('version', ''), v.get('license', '')
+
+            if fetch is None:
+                unverifiable.append({**v, 'reason': f'Unsupported language: {language}'})
+                continue
+
+            registry_license = fetch(name, version)
+
+            if registry_license is None:
+                unverifiable.append({**v, 'reason': 'Not found in registry'})
+            elif normalize(registry_license) == normalize(reported):
+                confirmed.append(v)
+            else:
+                updated = update_bom_license(name, version, registry_license)
+                has_corrections = has_corrections or updated
+                corrected.append({**v, 'correct_license': registry_license, 'bom_updated': updated})
+
+        if has_corrections:
+            tree.write(bom_file, xml_declaration=True, encoding='unicode')
+
+        print(json.dumps({
+            'confirmed': confirmed,
+            'corrected': corrected,
+            'unverifiable': unverifiable,
+            'has_corrections': has_corrections
+        }))
+        PYEOF
+
+        RESULT=$(python3 /tmp/verify_licenses.py)
+        echo "confirmed=$(echo "$RESULT" | jq -c '.confirmed')" >> "$GITHUB_OUTPUT"
+        echo "has_corrections=$(echo "$RESULT" | jq -r '.has_corrections')" >> "$GITHUB_OUTPUT"
